@@ -68,7 +68,7 @@ on:
       docker_image:
         description: "Select Armbian docker image"
         required: false
-        default: "resolute"
+        default: "bookworm"
         type: choice
         options:
           - trixie
@@ -78,7 +78,7 @@ on:
       kernel_sign:
         description: "Set the kernel custom signature"
         required: false
-        default: "-ophub"
+        default: "-woloong"
         type: choice
         options:
           - -ophub
@@ -91,7 +91,7 @@ on:
           - -summer-growing
           - -autumn-harvesting
           - -winter-storing
-          - -yourname
+          - -woloong
       kernel_config:
         description: "Set the path of kernel .config"
         required: false
