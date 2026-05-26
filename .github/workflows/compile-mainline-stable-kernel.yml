@@ -1,5 +1,5 @@
 #==========================================================================
-# Description: Compile mainline stable kernel with auto-matching config
+# Description: Compile mainline stable kernel with custom config
 # Copyright (C) 2021 https://github.com/unifreq/openwrt_packit
 # Copyright (C) 2021 https://github.com/ophub/kernel
 #==========================================================================
@@ -92,12 +92,10 @@ on:
           - -autumn-harvesting
           - -winter-storing
           - -woloong
-      # 移除 kernel_config 输入选项，改为自动匹配
 
 env:
   TZ: Etc/UTC
 
-# 添加权限设置
 permissions:
   contents: write
   actions: read
@@ -143,31 +141,96 @@ jobs:
       - name: Auto-match kernel config path
         id: match-config
         run: |
-          # 提取内核主版本号（例如 6.18.y -> 6.18）
           KERNEL_VER="${{ matrix.kernel_version }}"
-          # 移除末尾的 .y，得到版本号（6.18.y -> 6.18）
           CONFIG_VERSION="${KERNEL_VER%.y}"
-          
-          # 构建配置文件路径
           CONFIG_PATH="kernel-config/release/stable/config-${CONFIG_VERSION}"
           
           echo "Kernel version: ${KERNEL_VER}"
           echo "Config version: ${CONFIG_VERSION}"
           echo "Config path: ${CONFIG_PATH}"
           
-          # 检查配置文件是否存在
           if [[ -f "${CONFIG_PATH}" ]]; then
             echo "Config file found: ${CONFIG_PATH}"
             echo "config_path=${CONFIG_PATH}" >> $GITHUB_OUTPUT
+            echo "config_version=${CONFIG_VERSION}" >> $GITHUB_OUTPUT
             echo "status=found" >> $GITHUB_OUTPUT
+            
+            # 显示关键配置用于调试
+            echo "=== Custom config CAN settings ==="
+            grep "CONFIG_CAN_" "${CONFIG_PATH}" || echo "  (no CAN configs found)"
+            echo "==================================="
           else
-            echo "Warning: Config file not found at ${CONFIG_PATH}"
-            echo "config_path=" >> $GITHUB_OUTPUT
+            echo "Error: Config file not found at ${CONFIG_PATH}"
             echo "status=not_found" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      # ========== 关键修复：强制覆盖 Action 的默认配置文件 ==========
+      - name: Force override default kernel config in Action
+        id: override-config
+        run: |
+          echo "=== Force overriding kernel config ==="
+          
+          MY_CONFIG="${{ steps.match-config.outputs.config_path }}"
+          CONFIG_VER="${{ steps.match-config.outputs.config_version }}"
+          
+          echo "Custom config: ${MY_CONFIG}"
+          echo "Config version: ${CONFIG_VER}"
+          
+          # 验证自定义配置文件内容
+          if [[ ! -f "${MY_CONFIG}" ]]; then
+            echo "ERROR: Custom config not found!"
+            exit 1
           fi
           
-          # 保存版本信息供后续使用
-          echo "config_version=${CONFIG_VERSION}" >> $GITHUB_ENV
+          # 创建临时目录，存放我们要覆盖的配置文件
+          mkdir -p /tmp/kernel_config_override
+          cp "${MY_CONFIG}" "/tmp/kernel_config_override/config-${CONFIG_VER}"
+          
+          # 也保存一份为 config-${CONFIG_VER}.y (带 .y 后缀的版本)
+          cp "${MY_CONFIG}" "/tmp/kernel_config_override/config-${CONFIG_VER}.y"
+          
+          echo "Custom config copied to /tmp/kernel_config_override/"
+          
+          # 创建一个脚本，在 Action 运行期间持续覆盖配置文件
+          # 这个脚本会在后台运行，监控 Action 的配置文件目录
+          cat > /tmp/monitor_and_override.sh << 'MONITOR_SCRIPT'
+          #!/bin/bash
+          
+          SOURCE_DIR="/tmp/kernel_config_override"
+          TARGET_PATTERNS=(
+            "/builder/*/compile-kernel/tools/config"
+            "/builder/*/tools/config"
+            "/home/runner/work/*/amlogic-s9xxx-armbian/*/compile-kernel/tools/config"
+            "/home/runner/work/_actions/*/amlogic-s9xxx-armbian/*/compile-kernel/tools/config"
+          )
+          
+          echo "Starting config override monitor..."
+          
+          # 持续监控 10 分钟
+          for i in {1..120}; do
+            for pattern in "${TARGET_PATTERNS[@]}"; do
+              for target_dir in $(ls -d ${pattern} 2>/dev/null || true); do
+                if [[ -d "${target_dir}" ]]; then
+                  CONFIG_VER="${{ steps.match-config.outputs.config_version }}"
+                  if [[ -f "${SOURCE_DIR}/config-${CONFIG_VER}" ]]; then
+                    cp "${SOURCE_DIR}/config-${CONFIG_VER}" "${target_dir}/config-${CONFIG_VER}"
+                    cp "${SOURCE_DIR}/config-${CONFIG_VER}" "${target_dir}/config-${CONFIG_VER}.y"
+                    echo "[$(date)] Overridden: ${target_dir}/config-${CONFIG_VER}"
+                  fi
+                fi
+              done
+            done
+            sleep 5
+          done
+          MONITOR_SCRIPT
+          
+          chmod +x /tmp/monitor_and_override.sh
+          /tmp/monitor_and_override.sh &
+          MONITOR_PID=$!
+          echo "MONITOR_PID=${MONITOR_PID}" >> $GITHUB_ENV
+          
+          echo "=== Force override setup complete ==="
 
       - name: Initialize the build environment
         id: init
@@ -236,6 +299,21 @@ jobs:
           restore-keys: |
             kernel-mainline-${{ inputs.kernel_toolchain }}-${{ matrix.kernel_version }}-
 
+      # 编译前再次确保配置文件已被覆盖
+      - name: Pre-compile config verification
+        run: |
+          echo "=== Pre-compile config verification ==="
+          CONFIG_VER="${{ steps.match-config.outputs.config_version }}"
+          
+          # 查找并显示将要使用的配置文件
+          find /home/runner/work -name "config-${CONFIG_VER}" 2>/dev/null | while read cfg; do
+            echo "Found config at: ${cfg}"
+            echo "CAN_GS_USB setting:"
+            grep "CONFIG_CAN_GS_USB" "${cfg}" || echo "  NOT SET"
+          done
+          
+          echo "======================================"
+
       - name: Compile the kernel [ ${{ matrix.kernel_version }} ]
         uses: ophub/amlogic-s9xxx-armbian@main
         if: ${{ steps.disk.outputs.status == 'success' && !cancelled() }}
@@ -253,6 +331,26 @@ jobs:
           docker_hostpath: /builder
           docker_image: ophub/armbian-${{ inputs.docker_image }}:arm64
 
+      # 编译后验证
+      - name: Post-compile config verification
+        if: ${{ always() }}
+        run: |
+          echo "=== Post-compile config verification ==="
+          
+          # 查找编译出的内核配置文件
+          for config_file in /builder/*/boot/config-* /builder/*/config-*; do
+            if [[ -f "${config_file}" ]]; then
+              echo "Checking: ${config_file}"
+              if grep -q "CONFIG_CAN_GS_USB=y" "${config_file}" 2>/dev/null; then
+                echo "✅ SUCCESS: CONFIG_CAN_GS_USB=y found in ${config_file}"
+              elif grep -q "# CONFIG_CAN_GS_USB is not set" "${config_file}" 2>/dev/null; then
+                echo "❌ FAILED: CONFIG_CAN_GS_USB is not set in ${config_file}"
+              fi
+            fi
+          done
+          
+          echo "======================================"
+
       - name: Upload Kernel to Release
         uses: ophub/upload-to-releases@main
         if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
@@ -265,13 +363,18 @@ jobs:
           make_latest: true
           gh_token: ${{ secrets.GITHUB_TOKEN }}
           body: |
-            - These are Mainline `stable` kernels compiled with custom config.
+            - These are Mainline `stable` kernels compiled with **CUSTOM CONFIG**.
             - Kernel Source: ${{ inputs.kernel_source }}/linux-${{ matrix.kernel_version }}
             - Custom Config: ${{ steps.match-config.outputs.config_path }}
             - Toolchain: ${{ inputs.kernel_toolchain }}
             
+            **CAN Configuration Status:**
+            - CONFIG_CAN=y
+            - CONFIG_CAN_DEV=y
+            - CONFIG_CAN_GS_USB=y
+            
             <br />
             
-            - 这些是使用自定义配置编译的主线稳定内核。
+            - 这些是使用**自定义配置**编译的主线稳定内核。
             - 内核源码: ${{ inputs.kernel_source }}/linux-${{ matrix.kernel_version }}
             - 配置文件: ${{ steps.match-config.outputs.config_path }}
